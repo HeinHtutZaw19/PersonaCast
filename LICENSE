@@ -1,4 +1,3 @@
-cat > LICENSE << 'EOF'
 Copyright (c) 2026 Hein Htut Zaw
 
 All rights reserved.
@@ -7,4 +6,3 @@ This software and associated documentation files (the "Software") are the
 exclusive property of the copyright holder. No part of the Software may be
 used, copied, modified, merged, published, distributed, sublicensed, or sold
 without explicit written permission from the copyright holder.
-EOF
