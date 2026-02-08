@@ -9,7 +9,7 @@ from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 
 # Your service (you implement this)
-from services.speaker_sync_service import VideoSpeakerDetector
+from src.services.speaker_sync_service import VideoSpeakerDetector
 
 bp = Blueprint("speakers", __name__, url_prefix="/api/v1")
 

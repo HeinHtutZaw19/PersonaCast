@@ -45,7 +45,7 @@ def create_app(config=None):
     CORS(app)
     
     # Register blueprints
-    from routes import health, assets, transcripts, speakers
+    from src.routes import health, assets, transcripts, speakers
     
     app.register_blueprint(health.bp)
     app.register_blueprint(assets.bp)

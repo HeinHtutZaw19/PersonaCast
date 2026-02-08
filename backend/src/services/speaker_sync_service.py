@@ -1,361 +1,451 @@
 """
-Video Speaker Detection Module
-
-Analyzes video to detect who is speaking based on visual cues:
-- Lip movement detection
-- Face detection and tracking
-- Motion analysis around mouth region
-- Syncs with audio transcript timestamps
-
-This helps improve speaker diarization accuracy by combining audio and video.
+Production Video Speaker Detector - Part 2
+Complete implementation with InsightFace and Akamai database
 """
 
+from src.utils.face_recognition import (
+    AkamaiDatabaseManager,
+    ProductionFaceRecognitionTracker
+)
+from dotenv import load_dotenv
 import cv2
 import numpy as np
 from pathlib import Path
 import json
 from collections import defaultdict
+import hashlib
 import mediapipe as mp
 
 
-class VideoSpeakerDetector:
+load_dotenv()
+
+class ProductionVideoSpeakerDetector:
     """
-    Detects speakers in video using facial landmarks and lip movement analysis
+    Production-grade multi-shot video speaker detector
+    - InsightFace (ArcFace) embeddings
+    - Akamai database persistence
+    - Lip movement detection
     """
     
-    def __init__(self, video_path):
+    def __init__(self, video_path, db_config, model_name='buffalo_l', device='cpu'):
         """
-        Initialize the video speaker detector
+        Initialize detector
         
         Args:
-            video_path: Path to the video file
+            video_path: Path to video file
+            db_config: Database configuration dict
+            model_name: InsightFace model name
+            device: 'cpu' or 'cuda'
         """
         self.video_path = Path(video_path)
-        self.cap = cv2.VideoCapture(str(video_path))
+        self.video_uuid = hashlib.sha256(str(video_path).encode()).hexdigest()[:16]
         
+        # Open video
+        self.cap = cv2.VideoCapture(str(video_path))
         if not self.cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
         
-        # Video properties
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration = self.frame_count / self.fps
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.duration = self.frame_count / self.fps if self.frame_count > 0 else 0.0
         
-        # Initialize MediaPipe Face Mesh
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=5,  # Support up to 5 speakers
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+        # Initialize database and face recognition
+        print(f"\n{'='*80}")
+        print(f"Initializing Production Speaker Detector")
+        print(f"{'='*80}")
+        print(f"Video: {video_path}")
+        print(f"Duration: {self.duration:.2f}s, FPS: {self.fps:.2f}")
+        
+        self.db_manager = AkamaiDatabaseManager(db_config)
+        self.face_tracker = ProductionFaceRecognitionTracker(
+            db_manager=self.db_manager,
+            model_name=model_name,
+            device=device
         )
-        
-        # Lip landmark indices (MediaPipe Face Mesh)
-        # Upper lip: 61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291
-        # Lower lip: 146, 91, 181, 84, 17, 314, 405, 321, 375, 291
-        self.upper_lip_indices = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
-        self.lower_lip_indices = [146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
-        
-        print(f"Video loaded: {self.fps} FPS, {self.duration:.2f}s duration")
     
-    def calculate_lip_distance(self, landmarks):
+    def detect_faces_and_identify_per_frame(self):
         """
-        Calculate the vertical distance between upper and lower lips
-        
-        Args:
-            landmarks: MediaPipe face landmarks
-            
-        Returns:
-            float: Average vertical distance between lips (normalized)
-        """
-        # Get upper lip points
-        upper_lip_points = [landmarks[idx] for idx in self.upper_lip_indices]
-        lower_lip_points = [landmarks[idx] for idx in self.lower_lip_indices]
-        
-        # Calculate average y-coordinate for upper and lower lips
-        upper_avg_y = np.mean([p.y for p in upper_lip_points])
-        lower_avg_y = np.mean([p.y for p in lower_lip_points])
-        
-        # Return vertical distance
-        return abs(lower_avg_y - upper_avg_y)
-    
-    def detect_speaking_per_frame(self):
-        """
-        Analyze each frame to detect which faces are speaking
+        Process video frame by frame:
+        - Detect faces with InsightFace
+        - Extract ArcFace embeddings
+        - Identify/register persons in database
+        - Track lip movements (if MediaPipe available)
         
         Returns:
-            list: List of dicts with frame info and speaking indicators
+            list: Frame-by-frame analysis
         """
         results = []
         frame_number = 0
         
-        print("Analyzing video frames for speaker detection...")
+        print(f"\n{'='*80}")
+        print("Analyzing Video with Production Face Recognition")
+        print(f"{'='*80}\n")
         
         while self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
                 break
             
-            # Calculate timestamp
             timestamp = frame_number / self.fps
-            
-            # Convert to RGB for MediaPipe
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Detect faces
-            face_results = self.face_mesh.process(rgb_frame)
             
             frame_data = {
                 'frame': frame_number,
-                'timestamp': timestamp,
+                'timestamp': float(timestamp),
                 'faces': []
             }
             
-            if face_results.multi_face_landmarks:
-                for face_idx, face_landmarks in enumerate(face_results.multi_face_landmarks):
-                    # Calculate lip distance
-                    lip_distance = self.calculate_lip_distance(
-                        face_landmarks.landmark
-                    )
-                    
-                    # Get face bounding box (for position tracking)
-                    h, w, _ = frame.shape
-                    x_coords = [lm.x * w for lm in face_landmarks.landmark]
-                    y_coords = [lm.y * h for lm in face_landmarks.landmark]
-                    
-                    face_data = {
-                        'face_id': face_idx,
-                        'lip_distance': lip_distance,
-                        'bbox': {
-                            'x': int(min(x_coords)),
-                            'y': int(min(y_coords)),
-                            'width': int(max(x_coords) - min(x_coords)),
-                            'height': int(max(y_coords) - min(y_coords))
-                        }
+            # Extract face embeddings with InsightFace
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            faces = self.face_tracker.app.get(rgb_frame)
+            
+            for face_idx, face in enumerate(faces):
+                # Get embedding (512-dim ArcFace)
+                embedding = face.embedding
+                quality = float(face.det_score) if hasattr(face, 'det_score') else 0.9
+                
+                # Identify or register person in database
+                person_id = self.face_tracker.identify_or_register_person(
+                    embedding=embedding,
+                    video_id=self.video_uuid,
+                    frame_number=frame_number,
+                    timestamp=timestamp,
+                    quality_score=quality
+                )
+                
+                # Get bounding box
+                x1, y1, x2, y2 = [int(c) for c in face.bbox]
+                
+                # Try to get lip movement (requires MediaPipe)
+                lip_distance = 0.0
+                if self.face_tracker.face_landmarker is not None:
+                    # Extract face region and get landmarks
+                    try:
+                        face_crop = frame[y1:y2, x1:x2]
+                        if face_crop.size > 0:
+                            mp_image = mp.Image(
+                                image_format=mp.ImageFormat.SRGB,
+                                data=cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                            )
+                            timestamp_ms = int(frame_number * 1000.0 / self.fps)
+                            det = self.face_tracker.face_landmarker.detect_for_video(
+                                mp_image, timestamp_ms
+                            )
+                            
+                            if det.face_landmarks:
+                                lip_distance = self.face_tracker.calculate_lip_distance(
+                                    det.face_landmarks[0]
+                                )
+                    except Exception as e:
+                        print(f"  ⚠ Lip detection failed for frame {frame_number}: {e}")
+                
+                face_data = {
+                    'face_idx': face_idx,
+                    'person_id': int(person_id),
+                    'embedding_quality': float(quality),
+                    'lip_distance': float(lip_distance),
+                    'bbox': {
+                        'x': x1,
+                        'y': y1,
+                        'width': x2 - x1,
+                        'height': y2 - y1
                     }
-                    
-                    frame_data['faces'].append(face_data)
+                }
+                
+                frame_data['faces'].append(face_data)
             
             results.append(frame_data)
             frame_number += 1
             
             # Progress indicator
             if frame_number % 100 == 0:
-                progress = (frame_number / self.frame_count) * 100
-                print(f"Progress: {progress:.1f}%", end='\r')
+                progress = (frame_number / self.frame_count) * 100 if self.frame_count > 0 else 0
+                person_stats = self.db_manager.get_person_statistics()
+                print(f"Progress: {progress:.1f}% | Persons in DB: {len(person_stats)}", end='\r')
         
-        print("\nVideo analysis complete!")
+        print(f"\n\n✓ Video analysis complete!")
         self.cap.release()
+        
+        # Get final statistics
+        person_stats = self.db_manager.get_person_statistics()
+        print(f"Total unique persons in database: {len(person_stats)}")
+        for stat in person_stats[:5]:  # Show top 5
+            print(f"  Person {stat['person_id']}: {stat['embedding_count']} embeddings, "
+                  f"{stat['video_count']} videos")
+        
         return results
     
     def detect_speaking_segments(self, frame_data, threshold_multiplier=1.5):
         """
-        Identify speaking segments by analyzing lip movement patterns
+        Detect speaking segments per person based on lip movement
         
         Args:
-            frame_data: Frame-by-frame analysis data
-            threshold_multiplier: Multiplier for detecting significant lip movement
+            frame_data: Frame-by-frame analysis
+            threshold_multiplier: Sensitivity for lip movement
             
         Returns:
-            dict: Speaking segments per face
+            dict: Speaking segments per person_id
         """
-        # Track each face's lip movements
-        face_movements = defaultdict(list)
+        # Collect lip movements per person
+        person_movements = defaultdict(list)
         
         for frame in frame_data:
             for face in frame['faces']:
-                face_id = face['face_id']
-                face_movements[face_id].append({
+                person_id = face['person_id']
+                person_movements[person_id].append({
                     'timestamp': frame['timestamp'],
                     'lip_distance': face['lip_distance'],
+                    'quality': face['embedding_quality'],
                     'bbox': face['bbox']
                 })
         
-        # Detect speaking for each face
         speaking_segments = {}
         
-        for face_id, movements in face_movements.items():
-            # Calculate baseline (mouth at rest)
+        print(f"\n{'='*80}")
+        print("Detecting Speaking Segments")
+        print(f"{'='*80}\n")
+        
+        for person_id, movements in person_movements.items():
+            if not movements:
+                continue
+            
+            # Calculate baseline lip distance (mouth at rest)
             lip_distances = [m['lip_distance'] for m in movements]
-            baseline = np.percentile(lip_distances, 20)  # 20th percentile as baseline
+            baseline = float(np.percentile(lip_distances, 20))
             threshold = baseline * threshold_multiplier
             
-            # Detect segments where lip distance exceeds threshold
+            # Detect segments where lip movement exceeds threshold
             segments = []
-            current_segment = None
+            current = None
             
-            for i, movement in enumerate(movements):
-                is_speaking = movement['lip_distance'] > threshold
+            for m in movements:
+                is_speaking = m['lip_distance'] > threshold
                 
                 if is_speaking:
-                    if current_segment is None:
-                        # Start new segment
-                        current_segment = {
-                            'start': movement['timestamp'],
-                            'end': movement['timestamp'],
-                            'max_lip_distance': movement['lip_distance'],
-                            'bbox': movement['bbox']
+                    if current is None:
+                        current = {
+                            'start': m['timestamp'],
+                            'end': m['timestamp'],
+                            'max_lip_distance': m['lip_distance'],
+                            'avg_quality': m['quality'],
+                            'bbox': m['bbox']
                         }
                     else:
-                        # Continue segment
-                        current_segment['end'] = movement['timestamp']
-                        current_segment['max_lip_distance'] = max(
-                            current_segment['max_lip_distance'],
-                            movement['lip_distance']
+                        current['end'] = m['timestamp']
+                        current['max_lip_distance'] = max(
+                            current['max_lip_distance'], 
+                            m['lip_distance']
                         )
                 else:
-                    if current_segment is not None:
-                        # End segment (with minimum duration filter)
-                        if current_segment['end'] - current_segment['start'] >= 0.3:
-                            segments.append(current_segment)
-                        current_segment = None
+                    if current is not None:
+                        # End segment (minimum 0.3s duration)
+                        if current['end'] - current['start'] >= 0.3:
+                            segments.append(current)
+                        current = None
             
-            # Add final segment if exists
-            if current_segment is not None:
-                if current_segment['end'] - current_segment['start'] >= 0.3:
-                    segments.append(current_segment)
+            # Add final segment
+            if current is not None and current['end'] - current['start'] >= 0.3:
+                segments.append(current)
             
-            speaking_segments[face_id] = {
+            speaking_segments[person_id] = {
                 'baseline_lip_distance': baseline,
                 'threshold': threshold,
                 'segments': segments,
-                'total_speaking_time': sum(s['end'] - s['start'] for s in segments)
+                'total_speaking_time': sum(s['end'] - s['start'] for s in segments),
+                'appearance_count': len(movements)
             }
+            
+            print(f"Person {person_id}: {len(segments)} speaking segments, "
+                  f"{speaking_segments[person_id]['total_speaking_time']:.1f}s total")
         
         return speaking_segments
     
     def match_with_transcript(self, speaking_segments, transcript_utterances):
         """
-        Match video speaking segments with audio transcript utterances
+        Match video speaking segments with audio transcript
         
         Args:
-            speaking_segments: Speaking segments detected from video
-            transcript_utterances: Utterances from audio transcription
+            speaking_segments: Speaking segments per person
+            transcript_utterances: Audio transcript utterances
             
         Returns:
-            list: Utterances with corrected speaker assignments
+            list: Corrected utterances with person IDs
         """
         corrected_utterances = []
         
-        for utterance in transcript_utterances:
-            audio_start = utterance['start']
-            audio_end = utterance['end']
-            audio_speaker = utterance.get('speaker', 0)
+        print(f"\n{'='*80}")
+        print("Matching Speakers with Transcript")
+        print(f"{'='*80}\n")
+        
+        for utt in transcript_utterances:
+            audio_start = float(utt['start'])
+            audio_end = float(utt['end'])
+            audio_speaker = utt.get('speaker', 0)
+            duration = max(1e-6, audio_end - audio_start)
             
-            # Find which video face was speaking during this time
-            max_overlap = 0
-            matched_face = None
+            # Find person with maximum overlap
+            max_overlap = 0.0
+            matched_person = None
             
-            for face_id, data in speaking_segments.items():
+            for person_id, data in speaking_segments.items():
                 for segment in data['segments']:
-                    # Calculate overlap between audio utterance and video segment
                     overlap_start = max(audio_start, segment['start'])
                     overlap_end = min(audio_end, segment['end'])
-                    overlap = max(0, overlap_end - overlap_start)
+                    overlap = max(0.0, overlap_end - overlap_start)
                     
                     if overlap > max_overlap:
                         max_overlap = overlap
-                        matched_face = face_id
+                        matched_person = person_id
             
             # Create corrected utterance
-            corrected = utterance.copy()
-            if matched_face is not None:
-                corrected['video_speaker'] = matched_face
+            corrected = dict(utt)
+            if matched_person is not None:
+                corrected['video_speaker'] = matched_person
                 corrected['original_audio_speaker'] = audio_speaker
-                corrected['speaker_match_confidence'] = max_overlap / (audio_end - audio_start)
-                corrected['speaker'] = matched_face  # Override with video-based speaker
+                corrected['speaker_match_confidence'] = float(max_overlap / duration)
+                corrected['speaker'] = matched_person
             else:
                 corrected['video_speaker'] = None
                 corrected['speaker_match_confidence'] = 0.0
             
             corrected_utterances.append(corrected)
         
+        # Print summary
+        matched = sum(1 for u in corrected_utterances if u.get('video_speaker') is not None)
+        print(f"Matched {matched}/{len(corrected_utterances)} utterances to video speakers")
+        
         return corrected_utterances
     
     def analyze_and_sync(self, transcript_data, output_path=None):
         """
-        Complete pipeline: analyze video and sync with transcript
+        Complete pipeline with database persistence
         
         Args:
-            transcript_data: Transcript data with utterances
-            output_path: Optional path to save results
+            transcript_data: Transcript with utterances
+            output_path: Optional output file path
             
         Returns:
-            dict: Complete analysis with corrected speaker assignments
+            dict: Analysis results
         """
-        # Step 1: Analyze video frames
-        print("\nStep 1: Analyzing video frames...")
-        frame_data = self.detect_speaking_per_frame()
+        # Step 1: Detect faces and identify persons
+        frame_data = self.detect_faces_and_identify_per_frame()
         
         # Step 2: Detect speaking segments
-        print("\nStep 2: Detecting speaking segments...")
         speaking_segments = self.detect_speaking_segments(frame_data)
         
-        # Print summary
-        print("\nSpeaking Segments Summary:")
-        for face_id, data in speaking_segments.items():
-            print(f"  Face {face_id}: {len(data['segments'])} segments, "
-                  f"{data['total_speaking_time']:.1f}s total")
-        
         # Step 3: Match with transcript
-        print("\nStep 3: Matching with audio transcript...")
         corrected_utterances = self.match_with_transcript(
             speaking_segments,
             transcript_data.get('utterances', [])
         )
         
-        # Create result
+        # Step 4: Save to database
+        print(f"\n{'='*80}")
+        print("Saving Results to Database")
+        print(f"{'='*80}\n")
+        
+        # Save video metadata
+        person_stats = self.db_manager.get_person_statistics()
+        self.db_manager.save_video_metadata(
+            video_uuid=self.video_uuid,
+            video_path=str(self.video_path),
+            duration=self.duration,
+            fps=self.fps,
+            total_persons=len(person_stats),
+            metadata={'speaking_segments': len(speaking_segments)}
+        )
+        
+        # Save utterances
+        self.db_manager.save_utterances(self.video_uuid, corrected_utterances)
+        
+        print("✓ Results saved to database")
+        
+        # Generate summary
+        total = len(corrected_utterances)
+        matched = sum(1 for u in corrected_utterances if u.get('video_speaker') is not None)
+        high_conf = sum(1 for u in corrected_utterances if u.get('speaker_match_confidence', 0) > 0.7)
+        
+        speaker_counts = defaultdict(int)
+        for u in corrected_utterances:
+            speaker_id = u.get('speaker', u.get('video_speaker', 'unknown'))
+            speaker_counts[str(speaker_id)] += 1
+        
         result = {
             'video_path': str(self.video_path),
-            'video_fps': self.fps,
-            'video_duration': self.duration,
+            'video_uuid': self.video_uuid,
+            'video_fps': float(self.fps),
+            'video_duration': float(self.duration),
+            'total_unique_persons': len(person_stats),
+            'person_statistics': person_stats,
             'speaking_segments': speaking_segments,
             'corrected_utterances': corrected_utterances,
             'original_transcript': transcript_data.get('transcript', ''),
-            'correction_summary': self._generate_summary(corrected_utterances)
+            'correction_summary': {
+                'total_utterances': total,
+                'video_matched': matched,
+                'high_confidence_matches': high_conf,
+                'match_rate': float(matched / total) if total > 0 else 0.0,
+                'speaker_distribution': dict(speaker_counts)
+            }
         }
         
-        # Save if output path provided
+        # Save to file if requested
         if output_path:
-            with open(output_path, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"\nResults saved to: {output_path}")
+            self._save_results(result, output_path)
         
         return result
     
-    def _generate_summary(self, corrected_utterances):
-        """Generate summary of corrections made"""
-        total = len(corrected_utterances)
-        corrected = sum(1 for u in corrected_utterances if u.get('video_speaker') is not None)
-        high_confidence = sum(1 for u in corrected_utterances 
-                             if u.get('speaker_match_confidence', 0) > 0.7)
+    def _save_results(self, result, output_path):
+        """Save results to JSON file"""
+        # Convert numpy types for JSON
+        def convert_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_types(v) for v in obj]
+            elif isinstance(obj, (np.integer, np.floating)):
+                return obj.item()
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
         
-        return {
-            'total_utterances': total,
-            'video_matched': corrected,
-            'high_confidence_matches': high_confidence,
-            'match_rate': corrected / total if total > 0 else 0
-        }
+        result_json = convert_types(result)
+        
+        with open(output_path, 'w') as f:
+            json.dump(result_json, f, indent=2)
+        
+        print(f"✓ Results saved to: {output_path}")
 
 
-def sync_video_with_transcript(video_path, transcript_path, output_path=None):
+def sync_video_with_transcript_production(video_path, transcript_path, db_config,
+                                         output_path=None, model_name='buffalo_l',
+                                         device='cpu'):
     """
-    Convenience function to sync video with transcript
+    Production sync with database persistence
     
     Args:
-        video_path: Path to video file
-        transcript_path: Path to transcript JSON file
-        output_path: Optional path to save synced results
+        video_path: Path to video
+        transcript_path: Path to transcript JSON
+        db_config: Database configuration dict
+        output_path: Optional output file
+        model_name: InsightFace model
+        device: 'cpu' or 'cuda'
         
     Returns:
-        dict: Synced transcript with video-based speaker assignments
+        dict: Analysis results
     """
     # Load transcript
     with open(transcript_path, 'r') as f:
         transcript_data = json.load(f)
     
-    # Analyze video and sync
-    detector = VideoSpeakerDetector(video_path)
+    # Create detector
+    detector = ProductionVideoSpeakerDetector(
+        video_path=video_path,
+        db_config=db_config,
+        model_name=model_name,
+        device=device
+    )
+    
+    # Analyze and sync
     result = detector.analyze_and_sync(transcript_data, output_path)
     
     return result
@@ -363,30 +453,60 @@ def sync_video_with_transcript(video_path, transcript_path, output_path=None):
 
 if __name__ == "__main__":
     import sys
+    import os
     
     if len(sys.argv) < 3:
-        print("Usage: python video_speaker_sync.py <video_file> <transcript_json> [output_json]")
+        print("Usage: python production_speaker_detector.py <video> <transcript> [output]")
+        print("\nRequires environment variables:")
+        print("  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
         print("\nExample:")
-        print("  python video_speaker_sync.py podcast.mp4 transcript.json synced_output.json")
+        print("  export DB_HOST=db-postgresql-nyc1-12345.b.db.ondigitalocean.com")
+        print("  export DB_USER=doadmin")
+        print("  export DB_PASSWORD=your_password")
+        print("  python production_speaker_detector.py podcast.mp4 transcript.json")
         sys.exit(1)
     
     video_file = sys.argv[1]
     transcript_file = sys.argv[2]
-    output_file = sys.argv[3] if len(sys.argv) > 3 else "synced_transcript.json"
+    output_file = sys.argv[3] if len(sys.argv) > 3 else "synced_output.json"
     
-    print("=" * 80)
-    print("Video-Audio Speaker Synchronization")
-    print("=" * 80)
+    # Database configuration from environment
+    db_config = {
+        'host': os.getenv('DB_HOST'),
+        'port': int(os.getenv('DB_PORT', '25060')),
+        'database': os.getenv('DB_NAME', 'defaultdb'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD')
+    }
     
-    result = sync_video_with_transcript(video_file, transcript_file, output_file)
+    # Validate config
+    if not all([db_config['host'], db_config['user'], db_config['password']]):
+        print("Missing database configuration!")
+        print("Set DB_HOST, DB_USER, DB_PASSWORD environment variables")
+        sys.exit(1)
     
-    print("\n" + "=" * 80)
+    print("="*80)
+    print("Production Video-Audio Speaker Synchronization")
+    print("with InsightFace (ArcFace) and Akamai Database")
+    print("="*80)
+    
+    result = sync_video_with_transcript_production(
+        video_path=video_file,
+        transcript_path=transcript_file,
+        db_config=db_config,
+        output_path=output_file,
+        device='cuda' if os.getenv('USE_GPU', '').lower() == 'true' else 'cpu'
+    )
+    
+    print("\n" + "="*80)
     print("Synchronization Complete!")
-    print("=" * 80)
-    print(f"\nSummary:")
+    print("="*80)
+    
     summary = result['correction_summary']
-    print(f"  Total utterances: {summary['total_utterances']}")
-    print(f"  Video-matched: {summary['video_matched']}")
-    print(f"  High confidence: {summary['high_confidence_matches']}")
-    print(f"  Match rate: {summary['match_rate']:.1%}")
-    print(f"\nResults saved to: {output_file}")
+    print(f"\nUnique persons in database: {result['total_unique_persons']}")
+    print(f"Total utterances: {summary['total_utterances']}")
+    print(f"Video-matched: {summary['video_matched']}")
+    print(f"Match rate: {summary['match_rate']:.1%}")
+    print(f"\nSpeaker distribution:")
+    for speaker, count in summary['speaker_distribution'].items():
+        print(f"  Person {speaker}: {count} utterances")
