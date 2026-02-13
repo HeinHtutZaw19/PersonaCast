@@ -45,12 +45,11 @@ def create_app(config=None):
     CORS(app)
     
     # Register blueprints
-    from src.routes import health, assets, transcripts, speakers
+    from src.routes import health, assets, transcripts
     
     app.register_blueprint(health.bp)
     app.register_blueprint(assets.bp)
     app.register_blueprint(transcripts.bp)
-    app.register_blueprint(speakers.bp)
     
     # Log startup info
     @app.before_request

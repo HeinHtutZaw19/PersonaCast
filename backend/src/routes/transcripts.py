@@ -52,6 +52,7 @@ def transcribe_audio():
             return jsonify({"error": f"Audio file not found: {audio_file}"}), 404
 
         dg = get_deepgram_service()
+        print("[Transcribing] processing now")
         transcription_data = dg.transcribe_file(audio_file, file_id=file_id)
         dg.save_transcript(transcription_data, TRANSCRIPTS_FOLDER)
 
