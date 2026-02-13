@@ -3,9 +3,6 @@ flask-cors==4.0.0
 deepgram-sdk==3.4.0
 python-dotenv==1.0.0
 
-# Face embeddings (CPU)
-insightface==0.7.3
-onnxruntime==1.16.3
 
 # Video analysis
 opencv-python==4.8.1.78
@@ -16,3 +13,5 @@ scipy==1.11.4
 # DB
 psycopg2-binary==2.9.9
 Pillow==10.1.0
+pyaudio==0.2.14
+ultralytics
